@@ -136,3 +136,38 @@ def test_full_run_keeps_audit_chain_valid():
     rt.approve(p.request_id, approver="supervisor")
     rt.submit(req("delete_customer", customer_id="c-1"))
     assert rt.audit.verify()
+
+
+def test_approval_rechecks_policy_before_execution():
+    executed = []
+    policy = PolicyEngine([PolicyRule("approval-required", Verdict.REQUIRE_APPROVAL, min_risk=RiskTier.MEDIUM)])
+    rt = GovernedRuntime(policy)
+    rt.register("write", lambda: executed.append("ran"), RiskTier.MEDIUM)
+
+    pending = rt.submit(req("write"))
+    assert pending.status == "pending_approval"
+
+    policy.add(PolicyRule("emergency-deny", Verdict.DENY, tools={"write"}))
+    result = rt.approve(pending.request_id, approver="supervisor")
+
+    assert result.status == "denied"
+    assert executed == []
+    assert len(rt.approvals) == 0
+    assert any(e["event"] == "approval_revalidated" for e in rt.audit.events_for(pending.request_id))
+
+
+def test_pending_approvals_cannot_bypass_action_budget():
+    policy = PolicyEngine([PolicyRule("approval-required", Verdict.REQUIRE_APPROVAL, min_risk=RiskTier.MEDIUM)])
+    rt = GovernedRuntime(policy, budget_per_agent=1)
+    rt.register("write", lambda: "done", RiskTier.MEDIUM)
+
+    first = rt.submit(req("write"))
+    second = rt.submit(req("write"))
+    assert first.status == second.status == "pending_approval"
+
+    assert rt.approve(first.request_id, approver="supervisor").status == "executed"
+    blocked = rt.approve(second.request_id, approver="supervisor")
+
+    assert blocked.status == "denied"
+    assert "budget" in blocked.reason
+    assert len(rt.approvals) == 0
