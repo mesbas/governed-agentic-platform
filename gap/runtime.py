@@ -113,11 +113,45 @@ class GovernedRuntime:
         if self.separation_of_duties and approver == pending.request.agent_id:
             self.audit.append("approval_refused", {"request_id": request_id, "approver": approver, "reason": "self-approval"})
             raise PermissionError("separation of duties: requester cannot approve its own action")
+
+        # Approval can happen long after submission. Revalidate every control
+        # that may have changed while the request was waiting in the queue.
+        if self.kill_switch_engaged:
+            self.approvals.remove(request_id)
+            return self._deny(request_id, "kill switch engaged")
+
+        tool = self.tools.get(pending.request.tool)
+        if tool is None:
+            self.approvals.remove(request_id)
+            return self._deny(request_id, f"unknown tool '{pending.request.tool}'")
+
+        if (
+            self.budget_per_agent is not None
+            and tool.risk > RiskTier.READ
+            and self._executed[pending.request.agent_id] >= self.budget_per_agent
+        ):
+            self.approvals.remove(request_id)
+            return self._deny(
+                request_id,
+                f"action budget of {self.budget_per_agent} exhausted for {pending.request.agent_id}",
+            )
+
+        decision = self.policy.evaluate(pending.request, tool.risk)
+        self.audit.append(
+            "approval_revalidated",
+            {
+                "request_id": request_id,
+                "verdict": decision.verdict.value,
+                "rule": decision.rule,
+                "reason": decision.reason,
+            },
+        )
+        if decision.verdict == Verdict.DENY:
+            self.approvals.remove(request_id)
+            return self._deny(request_id, f"policy changed before approval: {decision.reason}")
+
         self.approvals.remove(request_id)
         self.audit.append("approved", {"request_id": request_id, "approver": approver, "note": note})
-        if self.kill_switch_engaged:
-            return self._deny(request_id, "kill switch engaged")
-        tool = self.tools[pending.request.tool]
         return self._execute(pending.request, tool)
 
     def reject(self, request_id: str, approver: str, reason: str) -> ActionResult:
